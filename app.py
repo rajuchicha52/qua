@@ -68,7 +68,7 @@ observable = SparsePauliOp.from_list(obs_list)
 
 qnn = EstimatorQNN(
     circuit=qc,
-    estimator=AerEstimator(options={"max_parallel_experiments": 0}), 
+    estimator=AerEstimator(options={"backend_options": {"max_parallel_experiments": 0}}), 
     observables=observable,
     input_params=input_params,
     weight_params=weights_p,
