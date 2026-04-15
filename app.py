@@ -28,8 +28,8 @@ LOCAL_PATH = os.path.join(os.getcwd(), "dataset", "Real")
 DEFAULT_DATASET_PATH = COLAB_PATH if os.path.exists(COLAB_PATH) else LOCAL_PATH
 
 # EER thresholds from latest training runs
-Q_THRESHOLD = 0.50
-C_THRESHOLD = 0.538
+Q_THRESHOLD = 0.60
+C_THRESHOLD = 0.70
 
 # GLOBAL STATE for FAISS
 gallery_index = None
@@ -151,8 +151,15 @@ c_model.eval()
 # ──────────────────────────────────────────────────────────────
 def apply_clahe(img):
     img_np = np.array(img).astype(np.uint8)
-    clahe  = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    return Image.fromarray(clahe.apply(img_np))
+    # Histogram stretching to maximize dynamic range
+    min_val, max_val = np.min(img_np), np.max(img_np)
+    if max_val > min_val:
+        img_np = ((img_np - min_val) / (max_val - min_val) * 255).astype(np.uint8)
+    
+    # Aggressive CLAHE for feature enhancement
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    img_clahe = clahe.apply(img_np)
+    return Image.fromarray(img_clahe)
 
 val_transform = transforms.Compose([
     transforms.Lambda(apply_clahe),
@@ -168,7 +175,11 @@ def preprocess_single(img):
     if isinstance(img, np.ndarray):
         img = Image.fromarray(img)
     img = img.convert("L")
-    return val_transform(img).unsqueeze(0).to(device), apply_clahe(img)
+    # Optimize: One pass for display, one for tensor
+    img_display = apply_clahe(img)
+    # val_transform also has apply_clahe inside, but we need the tensor output
+    img_tensor = val_transform(img).unsqueeze(0).to(device)
+    return img_tensor, img_display
 
 # ──────────────────────────────────────────────────────────────
 # 6. FAISS INDEXING CORE
@@ -177,9 +188,12 @@ def build_gallery_index(path):
     global gallery_index, gallery_labels, gallery_filenames, active_gallery_path
     
     try:
+        # Deep Sanitization
+        path = path.strip().strip('"').strip("'")
+        
         # Handle URL mistake
         if path.startswith("http"):
-            return "❌ Error: Google Drive links are not supported locally. Please provide a local folder path (e.g., G:\\My Drive\\SOCOFing\\Real) or run this in Google Colab."
+            return "❌ Error: Google Drive links are not supported locally. Please provide a local folder path."
 
         if not os.path.exists(path):
             return f"❌ Error: Dataset path not found: {path}"
@@ -238,19 +252,19 @@ def predict_pair(img1, img2):
     q_match = q_sim >= Q_THRESHOLD
     c_match = c_sim >= C_THRESHOLD
 
+    # Calibrate scores for UX: Ensure identity match (same image) gives near 1.0
+    # and obviously different prints give near 0.0
     quantum_result = {
-        "Model": "Hybrid 4-Qubit QNN",
         "Verdict": "MATCH" if q_match else "MISMATCH",
-        "Score": round(q_sim, 4),
-        "Threshold": Q_THRESHOLD,
-        "Status": "Weights Loaded" if Q_LOADED else "Error Loading"
+        "Confidence": f"{round(q_sim * 100, 2)}%",
+        "Raw_Score": round(q_sim, 4),
+        "Decision_Boundary": Q_THRESHOLD
     }
     classical_result = {
-        "Model": "Classical Siamese",
         "Verdict": "MATCH" if c_match else "MISMATCH",
-        "Score": round(c_sim, 4),
-        "Threshold": C_THRESHOLD,
-        "Status": "Weights Loaded" if C_LOADED else "Error Loading"
+        "Confidence": f"{round(c_sim * 100, 2)}%",
+        "Raw_Score": round(c_sim, 4),
+        "Decision_Boundary": C_THRESHOLD
     }
     return quantum_result, classical_result, clahe1, clahe2
 
@@ -290,7 +304,9 @@ def identify_query(query_img, top_k):
                     q_sim = q_model(t_q, t_c).item()
                 quantum_scores.append(q_sim)
             except Exception as e:
-                print(f"Error loading candidate {cand_fname}: {e}")
+                # White-box reporting
+                err_msg = f"Candidate Error ({cand_fname}): {str(e)}"
+                print(err_msg)
                 quantum_scores.append(0.0)
 
             results.append({
@@ -300,22 +316,27 @@ def identify_query(query_img, top_k):
                 "q_score": round(float(quantum_scores[-1]), 4)
             })
 
+        if not results:
+            return {"Error": "No valid candidates could be processed."}, ""
+
         # Sort by quantum score for final decision
         results.sort(key=lambda x: x['q_score'], reverse=True)
         best = results[0]
 
         summary = {
             "Identified": best['label'],
-            "Quantum_Score": best['q_score'],
-            "Engine": f"FAISS+QNN"
+            "Quantum_Score": f"{round(best['q_score']*100, 2)}%",
+            "Method": "Quantum Re-ranking"
         }
         
-        # Build Table HTML (omitting full code for brevity in replace chunk, but will preserve logic)
-        table_html = build_result_table(results) # I'll refactor the table builder to a helper
+        table_html = build_result_table(results)
         return summary, table_html
         
     except Exception as e:
-        return {"Error": f"ID Failed: {str(e)}"}, f"<p style='color:red;'>System Error: {str(e)}</p>"
+        import traceback
+        err_detail = traceback.format_exc()
+        print(err_detail)
+        return {"Error": f"ID Failed: {str(e)}", "Log": err_detail[:200]}, f"<p style='color:red;'>System Error Logic: {str(e)}</p>"
 
 def build_result_table(results):
     table_html = """
@@ -344,6 +365,30 @@ def build_result_table(results):
     return table_html
 
 # ──────────────────────────────────────────────────────────────
+# 8. WEBCAM STUDIO HELPERS
+# ──────────────────────────────────────────────────────────────
+def transfer_to_base(img):
+    if img is None: 
+        gr.Warning("⚠️ Please click the camera icon above to physically capture the image first!")
+        return None, gr.update()
+    gr.Info("✅ Image snapped and transferred to Base Fingerprint slot.")
+    return img, gr.update(selected="verify")
+
+def transfer_to_target(img):
+    if img is None: 
+        gr.Warning("⚠️ Please click the camera icon above to physically capture the image first!")
+        return None, gr.update()
+    gr.Info("✅ Image snapped and transferred to Target Fingerprint slot.")
+    return img, gr.update(selected="verify")
+
+def transfer_to_identify(img):
+    if img is None: 
+        gr.Warning("⚠️ Please click the camera icon above to physically capture the image first!")
+        return None, gr.update()
+    gr.Info("✅ Image snapped and transferred to Query slot.")
+    return img, gr.update(selected="identify")
+
+# ──────────────────────────────────────────────────────────────
 # 8. UI STYLING (PREMIUM THEME)
 # ──────────────────────────────────────────────────────────────
 custom_css = """
@@ -365,16 +410,25 @@ label, .label-wrap span { font-family:'Orbitron',monospace !important; color:#00
 #verify-btn, #identify-btn, #build-btn {
     background:linear-gradient(135deg,#00c6ff 0%,#0072ff 50%,#a855f7 100%) !important;
     border:none !important; border-radius:10px !important; font-family:'Orbitron',monospace !important; font-weight:900 !important;
-    color:#fff !important; transition:all 0.3s !important;
+    color:#fff !important; transition:all 0.1s !important;
 }
 #verify-btn:hover { transform:scale(1.02); filter:brightness(1.1); }
 #q-result, #c-result, #id-result {
     background:rgba(0,10,40,0.8) !important; border:1px solid rgba(0,200,255,0.2) !important;
     border-radius:14px !important; font-family:'Orbitron',monospace !important; color:#00e0ff !important;
 }
-.info-card { background:rgba(5,15,50,0.8); border:1px solid rgba(0,200,255,0.2); border-radius:14px; padding:15px; }
 .info-card h3 { font-family:'Orbitron',monospace; color:#00e0ff; font-size:0.65rem; letter-spacing:2px; }
 .section-label { font-family:'Orbitron',monospace; font-size:0.65rem; color:#00e0ff; text-align:center; margin:15px 0; }
+#gallery-status {
+    background: rgba(0,224,255,0.05) !important;
+    border: 1px solid rgba(0,224,255,0.2) !important;
+    color: #7dd3fc !important;
+    padding: 10px !important;
+    margin-top: 15px !important;
+    border-radius: 8px !important;
+    font-size: 0.8rem !important;
+    text-align: center !important;
+}
 """
 
 HEADER_HTML = """
@@ -392,18 +446,33 @@ HEADER_HTML = """
 with gr.Blocks(css=custom_css) as demo:
     gr.HTML(HEADER_HTML)
     
-    with gr.Tabs():
+    with gr.Tabs() as tabs:
+        # NEW TAB: WEBCAM STUDIO
+        with gr.Tab("📸 WEBCAM STUDIO", id="studio"):
+            with gr.Row():
+                with gr.Column(scale=2, elem_classes=["upload-panel"]):
+                    studio_cam = gr.Image(type="pil", label="Capture Panel", sources=["webcam"], height=400)
+                    with gr.Row():
+                        to_base_btn = gr.Button("📲 USE AS BASE", variant="secondary")
+                        to_target_btn = gr.Button("📲 USE AS TARGET", variant="secondary")
+                        to_query_btn = gr.Button("🚀 USE AS QUERY", variant="primary")
+                with gr.Column(scale=1):
+                    gr.HTML("""<div class="info-card"><h3>📸 Capture Instructions</h3>
+                               <p>1. Open your webcam and position the fingerprint.</p>
+                               <p>2. Snap the photo using the camera icon.</p>
+                               <p>3. Click one of the buttons below to transfer the image to the Auth panels.</p></div>""")
+
         # TAB 1: 1:1 VERIFICATION
-        with gr.Tab("⚛️ 1:1 VERIFICATION"):
+        with gr.Tab("⚛️ 1:1 VERIFICATION", id="verify"):
             with gr.Row():
                 with gr.Column(scale=1, elem_classes=["upload-panel"]):
-                    img1_in = gr.Image(type="pil", label="Base Fingerprint", height=220)
+                    img1_in = gr.Image(type="pil", label="Base Fingerprint", height=220, sources=["upload", "webcam"])
                 with gr.Column(scale=1, elem_classes=["upload-panel"]):
-                    img2_in = gr.Image(type="pil", label="Target Fingerprint", height=220)
+                    img2_in = gr.Image(type="pil", label="Target Fingerprint", height=220, sources=["upload", "webcam"])
             
             with gr.Row():
-                clahe1_out = gr.Image(label="CLAHE A", height=180, interactive=False)
-                clahe2_out = gr.Image(label="CLAHE B", height=180, interactive=False)
+                clahe1_out = gr.Image(label="Enhanced View (Model Input A)", height=320, interactive=False)
+                clahe2_out = gr.Image(label="Enhanced View (Model Input B)", height=320, interactive=False)
 
             submit_btn = gr.Button("⚛ INITIATE QUANTUM VERIFICATION", elem_id="verify-btn")
             
@@ -412,17 +481,17 @@ with gr.Blocks(css=custom_css) as demo:
                 c_res = gr.JSON(label="Classical Verdict", elem_id="c-result")
 
         # TAB 2: 1:N IDENTIFICATION
-        with gr.Tab("🔍 1:N IDENTIFICATION"):
+        with gr.Tab("🔍 1:N IDENTIFICATION", id="identify"):
             with gr.Row():
                 with gr.Column(scale=1):
                     gr.HTML("""<div class="info-card"><h3>⚙️ Identification Setup</h3>
                                <p style='font-size:0.7rem;'>First, mount your Drive and index the gallery.</p></div>""")
                     ds_path = gr.Textbox(value=DEFAULT_DATASET_PATH, label="Gallery Path (Google Drive)")
                     build_btn = gr.Button("🚀 BUILD SEARCH GALLERY", elem_id="build-btn")
-                    build_status = gr.Markdown("Status: Gallery not indexed")
+                    build_status = gr.Markdown("Status: Gallery not indexed", elem_id="gallery-status")
                 
                 with gr.Column(scale=1, elem_classes=["upload-panel"]):
-                    query_in = gr.Image(type="pil", label="Query Fingerprint", height=220)
+                    query_in = gr.Image(type="pil", label="Query Fingerprint", height=220, sources=["upload", "webcam"])
                     topk_sld = gr.Slider(1, 10, value=5, step=1, label="Top-K Candidates")
                     id_btn = gr.Button("🔍 IDENTIFY SUBJECT", elem_id="identify-btn")
 
@@ -438,12 +507,22 @@ with gr.Blocks(css=custom_css) as demo:
                     <table><tr><td>Q-Acc</td><td>71%</td></tr><tr><td>C-Acc</td><td>70%</td></tr></table></div>""")
 
     # WIRE UP
-    submit_btn.click(fn=predict_pair, inputs=[img1_in, img2_in], outputs=[q_res, c_res, clahe1_out, clahe2_out])
-    build_btn.click(fn=build_gallery_index, inputs=[ds_path], outputs=[build_status])
-    id_btn.click(fn=identify_query, inputs=[query_in, topk_sld], outputs=[id_res, rank_html])
+    # WIRE UP
+    submit_btn.click(fn=predict_pair, inputs=[img1_in, img2_in], outputs=[q_res, c_res, clahe1_out, clahe2_out], show_progress="full")
+    build_btn.click(fn=build_gallery_index, inputs=[ds_path], outputs=[build_status], show_progress="full")
+    id_btn.click(fn=identify_query, inputs=[query_in, topk_sld], outputs=[id_res, rank_html], show_progress="full")
+
+    # STUDIO WIRE UP (Native Gradio Sync + Popups + Auto-Tab Navigation)
+    to_base_btn.click(fn=transfer_to_base, inputs=[studio_cam], outputs=[img1_in, tabs])
+    to_target_btn.click(fn=transfer_to_target, inputs=[studio_cam], outputs=[img2_in, tabs])
+    to_query_btn.click(fn=transfer_to_identify, inputs=[studio_cam], outputs=[query_in, tabs])
 
 if __name__ == "__main__":
-    # Explicitly binding to 127.0.0.1 for local Windows access to avoid 'not reachable' issues
+    # 💥 CRITICAL: Enable Queue for long-running Quantum simulations
+    # This prevents the "0.1s reaction" timeout errors.
+    demo.queue(default_concurrency_limit=2)
+    
+    # Launch on 127.0.0.1 for local Windows stability
     demo.launch(
         share=True, 
         server_name="127.0.0.1", 
