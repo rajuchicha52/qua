@@ -1,0 +1,4 @@
+venv/
+.gradio/
+*.py
+!app.py

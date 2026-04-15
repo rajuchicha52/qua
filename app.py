@@ -27,8 +27,8 @@ COLAB_PATH = "/content/drive/MyDrive/SOCOFing/Real"
 LOCAL_PATH = os.path.join(os.getcwd(), "dataset", "Real")
 DEFAULT_DATASET_PATH = COLAB_PATH if os.path.exists(COLAB_PATH) else LOCAL_PATH
 
-# EER thresholds from latest training runs
-Q_THRESHOLD = 0.60
+# EER thresholds from latest 95%+ training runs
+Q_THRESHOLD = 0.61
 C_THRESHOLD = 0.70
 
 # GLOBAL STATE for FAISS
@@ -37,39 +37,38 @@ gallery_labels = []
 gallery_filenames = []
 active_gallery_path = DEFAULT_DATASET_PATH
 
-# ──────────────────────────────────────────────────────────────
-# 2. QUANTUM CIRCUIT SETUP
-# ──────────────────────────────────────────────────────────────
-num_qubits   = 4
+# Advanced 8-Qubit SEL Construction
+num_qubits   = 8
 qc           = QuantumCircuit(num_qubits)
-input_params = [Parameter(f"x{i}") for i in range(12)]
-weights_p    = [Parameter(f"w{i}") for i in range(24)]
+input_params = [Parameter(f"x{i}") for i in range(24)]
+weights_p    = [Parameter(f"w{i}") for i in range(8 * 3 * 3)]
 
-# Encoding (3 params per qubit: RX, RY, RZ)
-for i in range(4):
-    qc.rx(input_params[3*i], i)
-    qc.ry(input_params[3*i+1], i)
-    qc.rz(input_params[3*i+2], i)
+def add_sel_layer_inference(qc, p_params, input_data, layer_idx):
+    for i in range(num_qubits):
+        qc.rx(input_data[3*i], i)
+        qc.ry(input_data[3*i+1], i)
+        qc.rz(input_data[3*i+2], i)
+    offset = layer_idx * 24
+    for i in range(num_qubits):
+        qc.rz(p_params[offset + 3*i], i)
+        qc.ry(p_params[offset + 3*i + 1], i)
+        qc.rz(p_params[offset + 3*i + 2], i)
+    for i in range(num_qubits):
+        for j in range(i + 1, num_qubits):
+            qc.cx(i, j)
 
-qc.cx(0,1); qc.cx(1,2); qc.cx(2,3); qc.cx(3,0)
+# Synchronize 3-layer architecture
+for L in range(3):
+    add_sel_layer_inference(qc, weights_p, input_params, L)
 
-# Variational Layers (2 layers of RY, RZ, RX = 24 params)
-for layer in range(2):
-    offset = layer * 12
-    for i in range(4):
-        qc.ry(weights_p[offset + 3*i], i)
-        qc.rz(weights_p[offset + 3*i + 1], i)
-        qc.rx(weights_p[offset + 3*i + 2], i)
-    qc.cx(0,1); qc.cx(1,2); qc.cx(2,3); qc.cx(3,0)
-
-observable = SparsePauliOp.from_list([
-    ("ZIII", 1), ("IZII", 1), ("IIZI", 1), ("IIIZ", 1),
-    ("ZZII", 0.5), ("IIZZ", 0.5)
-])
+# Weighted Sum Observable (Voter System)
+# Average of individual Z measurements: 1/8 * (Z0 + Z1 + ... + Z7)
+obs_list = [("I" * i + "Z" + "I" * (num_qubits - 1 - i), 1/num_qubits) for i in range(num_qubits)]
+observable = SparsePauliOp.from_list(obs_list)
 
 qnn = EstimatorQNN(
     circuit=qc,
-    estimator=AerEstimator(),
+    estimator=AerEstimator(options={"max_parallel_experiments": 0}), 
     observables=observable,
     input_params=input_params,
     weight_params=weights_p,
@@ -101,10 +100,11 @@ class HybridQNNModel(nn.Module):
 
     def forward(self, x1, x2):
         f1, f2     = self.base(x1), self.base(x2)
-        diff       = torch.abs(f1 - f2)
+        diff       = (f1 - f2)**2
         diff_sc    = self.scale(diff) * torch.pi
         raw        = self.qnn(diff_sc)
-        return ((raw + 5) / 10.0).squeeze()
+        # Normalize average Z expectation value from [-1, 1] to [0, 1]
+        return ((raw + 1) / 2.0).squeeze()
 
 class ClassicalSiamese(nn.Module):
     def __init__(self, base_model):
@@ -124,14 +124,16 @@ class ClassicalSiamese(nn.Module):
 # ──────────────────────────────────────────────────────────────
 # 4. LOAD MODELS
 # ──────────────────────────────────────────────────────────────
-q_model = HybridQNNModel(make_resnet(num_outputs=12), quantum_layer).to(device)
+q_model = HybridQNNModel(make_resnet(num_outputs=24), quantum_layer).to(device)
 try:
-    q_model.load_state_dict(torch.load("hybrid_qnn_best.pth", map_location=device))
+    # Look for the new high-accuracy weights first
+    weight_path = "hybrid_95plus_best.pth" if os.path.exists("hybrid_95plus_best.pth") else "hybrid_qnn_best.pth"
+    q_model.load_state_dict(torch.load(weight_path, map_location=device))
     Q_LOADED = True
-    print("Quantum weights loaded successfully.")
+    print(f"Quantum weights ({weight_path}) loaded successfully.")
 except Exception as e:
     Q_LOADED = False
-    print(f"Quantum weights missing or mismatch: {e}")
+    print(f"Quantum 95% weights missing; starting in baseline mode: {e}")
 q_model.eval()
 
 c_model = ClassicalSiamese(make_resnet(num_outputs=4)).to(device)
@@ -169,7 +171,10 @@ val_transform = transforms.Compose([
 ])
 
 def get_label(filename):
-    return filename.split("__")[0]
+    parts = filename.split("__")
+    if len(parts) >= 2:
+        return f"{parts[0]}_{parts[1][2:]}" # Unique finger identity
+    return filename
 
 def preprocess_single(img):
     if isinstance(img, np.ndarray):
@@ -222,11 +227,12 @@ def build_gallery_index(path):
             img = Image.open(img_path).convert("L")
             img_t, _ = preprocess_single(img) # Ensure same preproc
             with torch.no_grad():
-                emb = q_model.base(img_t).cpu().numpy()
-            embeddings.append(emb[0])
+                emb_raw = q_model.base(img_t)
+                emb_norm = F.normalize(emb_raw, p=2, dim=1).cpu().numpy()
+            embeddings.append(emb_norm[0])
             
         embeddings_np = np.array(embeddings, dtype=np.float32)
-        gallery_index = faiss.IndexFlatL2(embeddings_np.shape[1])
+        gallery_index = faiss.IndexFlatIP(embeddings_np.shape[1])
         gallery_index.add(embeddings_np)
         
         return f"✅ SUCCESS: Indexed {len(gallery_labels)} subjects from {path}"
@@ -281,10 +287,12 @@ def identify_query(query_img, top_k):
 
         t_q, _ = preprocess_single(query_img)
         with torch.no_grad():
-            q_emb = q_model.base(t_q).cpu().numpy().astype(np.float32)
+            q_emb_raw = q_model.base(t_q)
+            q_emb = F.normalize(q_emb_raw, p=2, dim=1).cpu().numpy().astype(np.float32)
 
-        # Step 1: FAISS Search
-        D, I = gallery_index.search(q_emb, int(top_k))
+        # Step 1: FAISS Search (Deep Pool Expansion)
+        search_pool = min(int(top_k) * 10, len(gallery_filenames))
+        D, I = gallery_index.search(q_emb, search_pool)
         topk_indices = I[0]
         faiss_dists = D[0]
 
@@ -321,6 +329,8 @@ def identify_query(query_img, top_k):
 
         # Sort by quantum score for final decision
         results.sort(key=lambda x: x['q_score'], reverse=True)
+        # Trim back to requested Top K for display
+        results = results[:int(top_k)]
         best = results[0]
 
         summary = {
