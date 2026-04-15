@@ -58,7 +58,7 @@ def add_sel_layer_inference(qc, p_params, input_data, layer_idx):
             qc.cx(i, j)
 
 # Synchronize 3-layer architecture
-for L in range(3):
+for L in range(1):
     add_sel_layer_inference(qc, weights_p, input_params, L)
 
 # Weighted Sum Observable (Voter System)
